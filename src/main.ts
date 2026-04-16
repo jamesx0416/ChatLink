@@ -1,3 +1,5 @@
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import puppeteer, { type Browser, type Page } from "puppeteer";
 
 type CliOptions = {
@@ -7,6 +9,7 @@ type CliOptions = {
   port: number;
   pollMs: number;
   headful: boolean;
+  resume: boolean;
 };
 
 type ChatMessage = {
@@ -83,11 +86,67 @@ type DebugEventSummary = {
   text?: string;
 };
 
+type PersistedChatState = {
+  version: 1;
+  savedAt: string;
+  sequence: number;
+  messages: ChatMessage[];
+};
+
 const encoder = new TextEncoder();
 const CHROME_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+const HISTORY_FILE_PATH = join(process.cwd(), ".chatlink", "history.json");
+
+class HistoryPersistor {
+  private pendingState: PersistedChatState | null = null;
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(private readonly filePath: string) {}
+
+  schedule(state: PersistedChatState) {
+    this.pendingState = state;
+
+    if (this.flushTimer) {
+      return;
+    }
+
+    this.flushTimer = setTimeout(() => {
+      void this.flush();
+    }, 250);
+  }
+
+  async flush() {
+    const state = this.pendingState;
+
+    if (!state) {
+      if (this.flushTimer) {
+        clearTimeout(this.flushTimer);
+        this.flushTimer = null;
+      }
+      return;
+    }
+
+    this.pendingState = null;
+
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+
+    try {
+      await mkdir(dirname(this.filePath), { recursive: true });
+      await writeFile(this.filePath, JSON.stringify(state, null, 2));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[history] failed to persist ${this.filePath}: ${message}`);
+    }
+  }
+}
 
 class ChatStore {
+  constructor(private readonly onChange?: () => void) {}
+
   private readonly messages = new Map<string, ChatMessage>();
   private readonly order: string[] = [];
   private readonly clients = new Set<SseClient>();
@@ -97,6 +156,30 @@ class ChatStore {
     return this.order
       .map((id) => this.messages.get(id))
       .filter((message): message is ChatMessage => Boolean(message && message.status === "active"));
+  }
+
+  snapshot(): PersistedChatState {
+    return {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      sequence: this.sequence,
+      messages: this.order
+        .map((id) => this.messages.get(id))
+        .filter((message): message is ChatMessage => Boolean(message))
+        .map((message) => ({ ...message })),
+    };
+  }
+
+  hydrate(state: PersistedChatState) {
+    this.messages.clear();
+    this.order.length = 0;
+
+    for (const message of state.messages) {
+      this.messages.set(message.id, { ...message });
+      this.order.push(message.id);
+    }
+
+    this.sequence = state.sequence;
   }
 
   attachClient(controller: ReadableStreamDefaultController<Uint8Array>) {
@@ -140,6 +223,7 @@ class ChatStore {
         at: now,
         message: created,
       });
+      this.onChange?.();
       return;
     }
 
@@ -173,6 +257,7 @@ class ChatStore {
       at: now,
       message: { ...existing },
     });
+    this.onChange?.();
   }
 
   deleteById(id: string) {
@@ -190,6 +275,7 @@ class ChatStore {
       at: existing.lastSeenAt,
       id,
     });
+    this.onChange?.();
   }
 
   deleteByAuthorChannelId(authorChannelId: string) {
@@ -269,6 +355,7 @@ function parseCli(argv: string[]): CliOptions {
     port: 8787,
     pollMs: 1500,
     headful: false,
+    resume: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -281,6 +368,11 @@ function parseCli(argv: string[]): CliOptions {
 
     if (arg === "--headful") {
       options.headful = true;
+      continue;
+    }
+
+    if (arg === "--resume" || arg === "-r") {
+      options.resume = true;
       continue;
     }
 
@@ -337,11 +429,12 @@ function parseCli(argv: string[]): CliOptions {
 
 function printUsage() {
   console.log(`Usage:
-  bun run src/main.ts (--yt-url <youtube-stream-url> | --yt-id <youtube-video-id>) [--port 8787] [--host 127.0.0.1] [--poll-ms 1500] [--headful]
+  bun run src/main.ts (--yt-url <youtube-stream-url> | --yt-id <youtube-video-id>) [--port 8787] [--host 127.0.0.1] [--poll-ms 1500] [--headful] [-r|--resume]
 
 Examples:
   bun run src/main.ts --yt-url 'https://www.youtube.com/watch?v=VIDEO_ID'
   bun run src/main.ts --yt-id VIDEO_ID
+  bun run src/main.ts --yt-id VIDEO_ID --resume
   bun run src/main.ts --yt-url 'https://www.youtube.com/live/VIDEO_ID' --headful
 `);
 }
@@ -679,11 +772,27 @@ function authorRoleFromBadges(value: unknown): "moderator" | "member" | "default
 
       return [
         textFromNode(renderer.tooltip),
+        asString(renderer.tooltip),
         textFromNode(renderer.accessibility),
+        asString((renderer.accessibility as { label?: string } | undefined)?.label),
         asString(
-          (renderer.customThumbnail as { thumbnails?: Array<{ url?: string }> } | undefined)?.thumbnails?.[0]?.url,
+          (
+            renderer.accessibility as
+              | {
+                  accessibilityData?: {
+                    label?: string;
+                  };
+                }
+              | undefined
+          )?.accessibilityData?.label,
         ),
+        asString((renderer.icon as { iconType?: string } | undefined)?.iconType),
         asString(renderer.iconType),
+        asString(
+          (renderer.customThumbnail as { thumbnails?: Array<{ url?: string }> } | undefined)?.thumbnails
+            ?.map((thumbnail) => thumbnail.url ?? "")
+            .join(" "),
+        ),
       ]
         .filter(Boolean)
         .join(" ")
@@ -691,7 +800,7 @@ function authorRoleFromBadges(value: unknown): "moderator" | "member" | "default
     })
     .join(" ");
 
-  if (labels.includes("moderator")) {
+  if (labels.includes("moderator") || labels.includes("owner")) {
     return "moderator";
   }
 
@@ -762,6 +871,70 @@ function asString(value: unknown): string {
 
 function firstNonEmpty(...values: string[]) {
   return values.find((value) => value.trim().length > 0) ?? "";
+}
+
+function parsePersistedMessage(value: unknown): ChatMessage | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const message = value as Record<string, unknown>;
+  const id = asString(message.id);
+
+  if (!id) {
+    return null;
+  }
+
+  const status = message.status === "deleted" ? "deleted" : "active";
+  const authorRole =
+    message.authorRole === "moderator" || message.authorRole === "member" ? message.authorRole : "default";
+  const now = new Date().toISOString();
+
+  return {
+    id,
+    status,
+    author: asString(message.author),
+    authorChannelId: asString(message.authorChannelId),
+    authorRole,
+    text: asString(message.text),
+    timestamp: asString(message.timestamp),
+    rendererType: asString(message.rendererType),
+    avatarUrl: asString(message.avatarUrl),
+    firstSeenAt: asString(message.firstSeenAt) || now,
+    lastSeenAt: asString(message.lastSeenAt) || now,
+  };
+}
+
+async function loadPersistedChatState(filePath: string): Promise<PersistedChatState | null> {
+  try {
+    const raw = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as {
+      version?: unknown;
+      sequence?: unknown;
+      messages?: unknown;
+    };
+
+    if (parsed.version !== 1 || !Array.isArray(parsed.messages)) {
+      return null;
+    }
+
+    return {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      sequence: Number.isFinite(parsed.sequence) ? Number(parsed.sequence) : 0,
+      messages: parsed.messages
+        .map((message) => parsePersistedMessage(message))
+        .filter((message): message is ChatMessage => Boolean(message)),
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return null;
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[history] failed to load ${filePath}: ${message}`);
+    return null;
+  }
 }
 
 async function reloadBootstrap(page: Page) {
@@ -974,23 +1147,56 @@ async function main() {
   try {
     const options = parseCli(process.argv.slice(2));
     const chatUrl = options.ytId ? buildChatUrlFromVideoId(options.ytId) : normalizeChatUrl(options.ytUrl);
-    const store = new ChatStore();
+    const historyPersistor = new HistoryPersistor(HISTORY_FILE_PATH);
+    const store = new ChatStore(() => {
+      historyPersistor.schedule(store.snapshot());
+    });
     const debugStore = new DebugStore();
 
+    if (options.resume) {
+      const restored = await loadPersistedChatState(HISTORY_FILE_PATH);
+
+      if (restored) {
+        store.hydrate(restored);
+        console.log(`[history] resumed ${store.listActiveMessages().length} active messages from ${HISTORY_FILE_PATH}`);
+      } else {
+        console.log(`[history] no saved history found at ${HISTORY_FILE_PATH}`);
+      }
+    }
+
     console.log(`[collector] chat url: ${chatUrl}`);
-    startServer(store, debugStore, options);
+    const server = startServer(store, debugStore, options);
 
     const { browser, page } = await launchBrowser(chatUrl, options.headful);
     const bootstrap = await readBootstrap(page);
 
-    const shutdown = async () => {
-      console.log("\n[app] shutting down");
-      await browser.close();
+    let shuttingDown = false;
+    const shutdown = async (signal: string) => {
+      if (shuttingDown) {
+        return;
+      }
+
+      shuttingDown = true;
+      console.log(`\n[app] shutting down (${signal})`);
+      await historyPersistor.flush();
+
+      try {
+        server.stop(true);
+      } catch {}
+
+      try {
+        await browser.close();
+      } catch {}
+
       process.exit(0);
     };
 
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", () => {
+      void shutdown("SIGINT");
+    });
+    process.on("SIGTERM", () => {
+      void shutdown("SIGTERM");
+    });
 
     await startCollector(page, store, debugStore, bootstrap, options.pollMs);
   } catch (error) {

@@ -22,10 +22,17 @@ Or pass only the video ID:
 bun run src/main.ts --yt-id VIDEO_ID
 ```
 
+Resume the last locally saved history before reconnecting:
+
+```bash
+bun run src/main.ts --yt-id VIDEO_ID --resume
+```
+
 Useful flags:
 
 - `--yt-url`: YouTube stream or live chat URL. Quote it in `zsh`.
 - `--yt-id`: YouTube video ID
+- `-r`, `--resume`: reload the last saved `.chatlink/history.json` snapshot on startup
 - `--port`: localhost port, default `8787`
 - `--host`: bind address, default `127.0.0.1`
 - `--poll-ms`: minimum polling interval, default `1500`. The collector also respects YouTube's continuation timeout.
@@ -47,6 +54,7 @@ Useful flags:
 
 - The collector uses YouTube's internal `youtubei/v1/live_chat/get_live_chat` feed instead of scraping rendered DOM nodes.
 - Delete handling is based on structured live chat actions such as item deletion, item replacement with tombstones, item removal, and delete-by-author events.
+- The bridge persists chat state to `.chatlink/history.json`. Use `--resume` to preload that snapshot after restarts.
 - `youtubei` is an internal web endpoint, not a stable public API. Expect occasional breakage when YouTube changes its web client.
 - The Twitch userscript in `examples/twitch-bridge.user.js` is only a starter example. Twitch changes its DOM frequently, so selectors there may need adjustment.
 - Some streams may show consent or age gates before chat becomes readable. Those cases are not handled yet.
