@@ -4,13 +4,13 @@ Local bridge that opens a YouTube live chat in Puppeteer, bootstraps YouTube's i
 
 ## Run
 
-0. Install dependencies:
+1. Install dependencies:
 
 ```bash
 bun install
 ```
 
-0. Start the bridge with a YouTube stream URL:
+2. Start the bridge with a YouTube stream URL:
 
 ```bash
 bun run src/main.ts --yt-url 'https://www.youtube.com/watch?v=VIDEO_ID'
@@ -28,9 +28,9 @@ Resume the last locally saved history before reconnecting:
 bun run src/main.ts --yt-id VIDEO_ID --resume
 ```
 
-0. Add userscript to tempermonkey
+# 3. Add userscript to tempermonkey
 
-File is at examples/twitch-bridge.user.js
+Userscript is at examples/twitch-bridge.user.js
 
 Useful flags:
 
