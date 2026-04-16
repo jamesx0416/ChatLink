@@ -14,6 +14,7 @@ type ChatMessage = {
   status: "active" | "deleted";
   author: string;
   authorChannelId: string;
+  authorRole: "moderator" | "member" | "default";
   text: string;
   timestamp: string;
   rendererType: string;
@@ -145,6 +146,7 @@ class ChatStore {
     const changed =
       existing.author !== message.author ||
       existing.authorChannelId !== message.authorChannelId ||
+      existing.authorRole !== message.authorRole ||
       existing.text !== message.text ||
       existing.timestamp !== message.timestamp ||
       existing.avatarUrl !== message.avatarUrl ||
@@ -158,6 +160,7 @@ class ChatStore {
 
     existing.author = message.author;
     existing.authorChannelId = message.authorChannelId;
+    existing.authorRole = message.authorRole;
     existing.text = message.text;
     existing.timestamp = message.timestamp;
     existing.avatarUrl = message.avatarUrl;
@@ -645,6 +648,7 @@ function itemToMessage(item: unknown): Omit<ChatMessage, "firstSeenAt" | "lastSe
     status: rendererType.includes("tombstone") ? "deleted" : "active",
     author: textFromNode(payload.authorName),
     authorChannelId: asString(payload.authorExternalChannelId),
+    authorRole: authorRoleFromBadges(payload.authorBadges),
     text: firstNonEmpty(
       textFromNode(payload.message),
       textFromNode(payload.purchaseAmountText),
@@ -657,6 +661,49 @@ function itemToMessage(item: unknown): Omit<ChatMessage, "firstSeenAt" | "lastSe
     rendererType,
     avatarUrl: thumbnailUrl(payload.authorPhoto),
   };
+}
+
+function authorRoleFromBadges(value: unknown): "moderator" | "member" | "default" {
+  if (!Array.isArray(value)) {
+    return "default";
+  }
+
+  const labels = value
+    .map((entry) => {
+      const renderer = (entry as { liveChatAuthorBadgeRenderer?: Record<string, unknown> })
+        ?.liveChatAuthorBadgeRenderer;
+
+      if (!renderer) {
+        return "";
+      }
+
+      return [
+        textFromNode(renderer.tooltip),
+        textFromNode(renderer.accessibility),
+        asString(
+          (renderer.customThumbnail as { thumbnails?: Array<{ url?: string }> } | undefined)?.thumbnails?.[0]?.url,
+        ),
+        asString(renderer.iconType),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+    })
+    .join(" ");
+
+  if (labels.includes("moderator")) {
+    return "moderator";
+  }
+
+  if (
+    labels.includes("member") ||
+    labels.includes("subscriber") ||
+    labels.includes("sponsor")
+  ) {
+    return "member";
+  }
+
+  return "default";
 }
 
 function textFromNode(value: unknown): string {

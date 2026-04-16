@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chatlink Twitch Mirror
 // @namespace    chatlink
-// @version      0.4.0
+// @version      0.5.0
 // @description  Inject Chatlink localhost events into Twitch's native chat message flow.
 // @match        https://www.twitch.tv/*
 // @match        https://www.twitch.tv/popout/*/chat
@@ -227,7 +227,7 @@
     username.dataset.aTarget = "chat-message-username";
     username.dataset.testSelector = "message-username";
     username.dataset.aUser = row.dataset.aUser;
-    username.style.color = "rgb(255, 222, 122)";
+    username.style.color = pickUsernameColor(message);
     username.textContent = message.author || "YouTube";
 
     colon.setAttribute("aria-hidden", "true");
@@ -254,6 +254,18 @@
     outer.append(inner);
 
     return outer;
+  }
+
+  function pickUsernameColor(message) {
+    if (message.authorRole === "moderator") {
+      return "#4aa3ff";
+    }
+
+    if (message.authorRole === "member") {
+      return "#34c759";
+    }
+
+    return "#b3b3b3";
   }
 
   function trimRenderedMessages() {
