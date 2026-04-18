@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Chatlink Twitch Mirror
 // @namespace    chatlink
-// @version      0.8.0
+// @version      0.8.5
 // @description  Inject Chatlink localhost events into Twitch's native chat message flow.
 // @match        https://www.twitch.tv/*
 // @match        https://www.twitch.tv/popout/*/chat
+// @match        https://dashboard.twitch.tv/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
 // @connect      127.0.0.1
@@ -17,6 +18,9 @@
   "use strict";
 
   const BRIDGE_BASE = "http://127.0.0.1:8787";
+  const CREATOR_CHANNEL_NAME = "@t3dotgg";
+  const CREATOR_NICKNAME = "Theo";
+  const SHOW_YT_PROFILE_PHOTO = true;
   const MAX_RENDERED_MESSAGES = 120;
   const POLL_INTERVAL_MS = 2000;
   const SSE_RETRY_DELAY_MS = 3000;
@@ -146,11 +150,28 @@
       return !blockedRoots.has(root);
     }
 
+    if (hostname === "dashboard.twitch.tv") {
+      return (
+        /^\/u\/[^/]+\/stream-manager(?:\/.*)?$/.test(pathname) ||
+        /^\/popout\/u\/[^/]+\/stream-manager(?:\/.*)?$/.test(pathname)
+      );
+    }
+
     return false;
   }
 
   function getCurrentChannelLogin() {
     const segments = window.location.pathname.split("/").filter(Boolean);
+
+    if (window.location.hostname === "dashboard.twitch.tv") {
+      if (segments[0] === "u" && segments[1]) {
+        return segments[1].toLowerCase();
+      }
+
+      if (segments[0] === "popout" && segments[1] === "u" && segments[2]) {
+        return segments[2].toLowerCase();
+      }
+    }
 
     if (segments[0] === "popout" && segments[1]) {
       return segments[1].toLowerCase();
@@ -161,6 +182,154 @@
 
   function normalizeMatchText(value) {
     return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  function normalizeCreatorName(value) {
+    return normalizeMatchText(value).replace(/^@+/, "");
+  }
+
+  function creatorNickname() {
+    return String(CREATOR_NICKNAME || "").trim();
+  }
+
+  function escapeRegExp(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function creatorMentionRegex(flags = "i") {
+    const creatorName = normalizeCreatorName(CREATOR_CHANNEL_NAME);
+
+    if (!creatorName) {
+      return null;
+    }
+
+    return new RegExp(`(^|[^\\w])@${escapeRegExp(creatorName)}(?=\\b)`, flags);
+  }
+
+  function isCreatorAuthor(message) {
+    const creatorName = normalizeCreatorName(CREATOR_CHANNEL_NAME);
+
+    if (!creatorName) {
+      return false;
+    }
+
+    return normalizeCreatorName(message.author) === creatorName;
+  }
+
+  function messageMentionsCreator(message) {
+    const mentionRegex = creatorMentionRegex("i");
+
+    if (!mentionRegex) {
+      return false;
+    }
+
+    return mentionRegex.test(String(message.text || ""));
+  }
+
+  function isCreatorRelatedMessage(message) {
+    return isCreatorAuthor(message) || messageMentionsCreator(message);
+  }
+
+  function displayAuthorName(message) {
+    if (isCreatorAuthor(message)) {
+      return creatorNickname() || normalizeCreatorName(CREATOR_CHANNEL_NAME) || message.author || "YouTube";
+    }
+
+    return message.author || "YouTube";
+  }
+
+  function displayMessageText(message) {
+    const originalText = String(message.text || "");
+    const nickname = creatorNickname();
+    const mentionRegex = creatorMentionRegex("ig");
+
+    if (!nickname || !mentionRegex) {
+      return originalText;
+    }
+
+    return originalText.replace(mentionRegex, (_, prefix) => `${prefix}${nickname}`);
+  }
+
+  function linkifyTextParts(value) {
+    const text = String(value || "");
+    const parts = [];
+    const urlPattern = /((?:https?:\/\/|www\.)[^\s]+)/gi;
+    let lastIndex = 0;
+    let match;
+
+    while ((match = urlPattern.exec(text)) !== null) {
+      const rawUrl = match[0];
+      const index = match.index;
+
+      if (index > lastIndex) {
+        parts.push({
+          kind: "text",
+          value: text.slice(lastIndex, index),
+        });
+      }
+
+      let suffix = "";
+      let cleanUrl = rawUrl;
+
+      while (/[),.!?:;]+$/.test(cleanUrl)) {
+        suffix = cleanUrl.slice(-1) + suffix;
+        cleanUrl = cleanUrl.slice(0, -1);
+      }
+
+      if (cleanUrl) {
+        parts.push({
+          kind: "link",
+          value: cleanUrl,
+          href: cleanUrl.startsWith("http://") || cleanUrl.startsWith("https://")
+            ? cleanUrl
+            : `https://${cleanUrl}`,
+        });
+      }
+
+      if (suffix) {
+        parts.push({
+          kind: "text",
+          value: suffix,
+        });
+      }
+
+      lastIndex = index + rawUrl.length;
+    }
+
+    if (lastIndex < text.length) {
+      parts.push({
+        kind: "text",
+        value: text.slice(lastIndex),
+      });
+    }
+
+    return parts.length > 0
+      ? parts
+      : [
+          {
+            kind: "text",
+            value: text,
+          },
+        ];
+  }
+
+  function appendLinkedText(container, value) {
+    for (const part of linkifyTextParts(value)) {
+      if (part.kind === "link") {
+        const anchor = document.createElement("a");
+        anchor.href = part.href;
+        anchor.textContent = part.value;
+        anchor.target = "_blank";
+        anchor.rel = "noopener noreferrer";
+        anchor.style.color = "inherit";
+        anchor.style.textDecoration = "underline";
+        anchor.style.wordBreak = "break-all";
+        container.append(anchor);
+        continue;
+      }
+
+      container.append(document.createTextNode(part.value));
+    }
   }
 
   function twitchSignature(author, text) {
@@ -259,6 +428,8 @@
     const layout = document.createElement("div");
     const highlight = document.createElement("div");
     const messageContainer = document.createElement("div");
+    const avatarWrap = document.createElement("div");
+    const avatar = document.createElement("img");
     const spacer = document.createElement("div");
     const contentWrap = document.createElement("div");
     const noBg = document.createElement("div");
@@ -271,6 +442,10 @@
     const colon = document.createElement("span");
     const body = document.createElement("span");
     const text = document.createElement("span");
+    const creatorRelated = isCreatorRelatedMessage(message);
+    const creatorAuthor = isCreatorAuthor(message);
+    const renderedAuthor = displayAuthorName(message);
+    const renderedText = displayMessageText(message);
 
     outer.dataset.chatlinkShell = "true";
     outer.dataset.chatlinkSentTs = String(messageTimestampMs(message));
@@ -283,13 +458,32 @@
     row.dataset.aUser = `yt:${message.authorChannelId || message.id}`;
     row.tabIndex = 0;
     row.setAttribute("align-items", "center");
-    row.setAttribute("aria-label", `${message.author || "YouTube"}: ${message.text || ""}`);
+    row.setAttribute("aria-label", `${renderedAuthor}: ${renderedText}`);
 
     layout.className = "Layout-sc-1xcs6mc-0 AoXTY";
     highlight.className = "Layout-sc-1xcs6mc-0 haALyh chat-line__message-highlight";
-    highlight.style.background = "linear-gradient(90deg, rgba(255,0,0,0.35), rgba(255,0,0,0))";
+    highlight.style.background = "transparent";
 
     messageContainer.className = "Layout-sc-1xcs6mc-0 AoXTY chat-line__message-container";
+    messageContainer.style.display = "flex";
+    messageContainer.style.alignItems = "center";
+    avatarWrap.className = "Layout-sc-1xcs6mc-0";
+    avatarWrap.style.display = SHOW_YT_PROFILE_PHOTO && message.avatarUrl ? "flex" : "none";
+    avatarWrap.style.alignItems = "center";
+    avatarWrap.style.marginRight = "8px";
+    avatarWrap.style.alignSelf = "center";
+    avatar.className = "chatlink-avatar";
+    avatar.src = message.avatarUrl || "";
+    avatar.alt = "";
+    avatar.width = 20;
+    avatar.height = 20;
+    avatar.loading = "lazy";
+    avatar.referrerPolicy = "no-referrer";
+    avatar.style.width = "20px";
+    avatar.style.height = "20px";
+    avatar.style.borderRadius = "999px";
+    avatar.style.objectFit = "cover";
+    avatar.style.display = "block";
     contentWrap.className = "Layout-sc-1xcs6mc-0";
     noBg.className = "Layout-sc-1xcs6mc-0 fHdBNk chat-line__no-background";
     content.className = "Layout-sc-1xcs6mc-0 dtoOxd";
@@ -312,6 +506,7 @@
     badge.style.lineHeight = "1";
     badge.style.marginRight = "6px";
     badge.title = "Mirrored from YouTube";
+    badge.style.display = "none";
 
     usernameButton.className = "chat-line__username";
     usernameButton.setAttribute("role", "button");
@@ -322,7 +517,7 @@
     username.dataset.testSelector = "message-username";
     username.dataset.aUser = row.dataset.aUser;
     username.style.color = pickUsernameColor(message);
-    username.textContent = message.author || "YouTube";
+    username.textContent = renderedAuthor;
 
     colon.setAttribute("aria-hidden", "true");
     colon.textContent = ": ";
@@ -332,7 +527,26 @@
 
     text.className = "text-fragment";
     text.dataset.aTarget = "chat-message-text";
-    text.textContent = message.text || "";
+    appendLinkedText(text, renderedText);
+
+    if (creatorRelated) {
+      badge.style.background = "rgb(0, 0, 0)";
+      badge.style.color = "rgb(249, 216, 73)";
+    }
+
+    if (creatorAuthor) {
+      username.style.background = "rgb(249, 216, 73)";
+      username.style.color = "rgb(0, 0, 0)";
+      username.style.borderRadius = "4px";
+      username.style.padding = "0 4px";
+    }
+
+    if (creatorRelated && !creatorAuthor) {
+      text.style.background = "rgb(249, 216, 73)";
+      text.style.color = "rgb(0, 0, 0)";
+      text.style.borderRadius = "4px";
+      text.style.padding = "0 4px";
+    }
 
     badgeSlot.append(badge);
     usernameButton.append(username);
@@ -341,7 +555,8 @@
     content.append(usernameWrap, colon, body);
     noBg.append(content);
     contentWrap.append(noBg);
-    messageContainer.append(spacer, contentWrap);
+    avatarWrap.append(avatar);
+    messageContainer.append(avatarWrap, spacer, contentWrap);
     layout.append(highlight, messageContainer);
     row.append(layout);
     inner.append(row);
@@ -402,14 +617,14 @@
 
   function pickUsernameColor(message) {
     if (message.authorRole === "moderator") {
-      return "#4aa3ff";
+      return "rgb(41, 94, 205)";
     }
 
     if (message.authorRole === "member") {
-      return "#34c759";
+      return "rgb(53, 114, 39)";
     }
 
-    return "#b3b3b3";
+    return "rgb(112, 112, 112)";
   }
 
   function trimRenderedMessages() {
@@ -1147,17 +1362,6 @@
     style.textContent = `
       [data-chatlink="youtube"] .chat-line__message-container {
         position: relative;
-      }
-
-      [data-chatlink="youtube"] .chat-line__message-container::before {
-        content: "";
-        position: absolute;
-        left: -6px;
-        top: 4px;
-        bottom: 4px;
-        width: 2px;
-        border-radius: 999px;
-        background: rgba(255, 0, 51, 0.65);
       }
 
       [data-chatlink="youtube"] [data-a-target="chat-message-text"] {
