@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import tmi from "@tmi.js/chat";
 import puppeteer, { type Browser, type Page } from "puppeteer";
 
 type CliOptions = {
@@ -44,6 +45,32 @@ type SseClient = {
   controller: ReadableStreamDefaultController<Uint8Array>;
   heartbeatId: ReturnType<typeof setInterval>;
 };
+
+type EventsSnapshot = {
+  sequence: number;
+  messages: ChatMessage[];
+};
+
+type TwitchChatMessage = {
+  id: string;
+  channel: string;
+  author: string;
+  text: string;
+  timestampMs: number;
+};
+
+type TimelineEntry =
+  | {
+      kind: "twitch";
+      id: string;
+      timestampMs: number;
+    }
+  | {
+      kind: "youtube";
+      id: string;
+      timestampMs: number;
+      message: ChatMessage;
+    };
 
 type InnerTubeBootstrap = {
   apiKey: string;
@@ -97,6 +124,113 @@ const encoder = new TextEncoder();
 const CHROME_USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 const HISTORY_FILE_PATH = join(process.cwd(), ".chatlink", "history.json");
+const TIMELINE_YOUTUBE_LIMIT = 120;
+
+class TwitchChatStore {
+  private readonly client = new tmi.Client();
+  private readonly messagesByChannel = new Map<string, TwitchChatMessage[]>();
+  private readonly joinedChannels = new Set<string>();
+  private connectPromise: Promise<void> | null = null;
+
+  constructor() {
+    this.client.on("message", (event) => {
+      const channel = normalizeTwitchChannel(event.channel.login);
+      const nextMessage: TwitchChatMessage = {
+        id: event.message.id,
+        channel,
+        author: event.user.display || event.user.login,
+        text: event.message.text,
+        timestampMs:
+          typeof event.tags?.tmiSentTs === "number" && Number.isFinite(event.tags.tmiSentTs)
+            ? event.tags.tmiSentTs
+            : Date.now(),
+      };
+
+      const channelMessages = this.messagesByChannel.get(channel) ?? [];
+      channelMessages.push(nextMessage);
+
+      if (channelMessages.length > 500) {
+        channelMessages.splice(0, channelMessages.length - 500);
+      }
+
+      this.messagesByChannel.set(channel, channelMessages);
+    });
+
+    this.client.on("part", (event) => {
+      this.joinedChannels.delete(normalizeTwitchChannel(event.channel.login));
+    });
+
+    this.client.on("close", () => {
+      this.joinedChannels.clear();
+      this.connectPromise = null;
+    });
+
+    this.client.on("error", (error) => {
+      console.error(`[twitch] ${error.message}`);
+    });
+  }
+
+  async ensureChannel(channel: string) {
+    const normalized = normalizeTwitchChannel(channel);
+    await this.connect();
+
+    if (this.joinedChannels.has(normalized)) {
+      return normalized;
+    }
+
+    await this.client.join(normalized);
+    this.joinedChannels.add(normalized);
+    return normalized;
+  }
+
+  listChannelMessages(channel: string, limit = 250) {
+    const normalized = normalizeTwitchChannel(channel);
+    const messages = this.messagesByChannel.get(normalized) ?? [];
+    return messages.slice(-limit);
+  }
+
+  close() {
+    this.client.close();
+  }
+
+  private async connect() {
+    if (this.client.isConnected()) {
+      return;
+    }
+
+    if (this.connectPromise) {
+      return this.connectPromise;
+    }
+
+    this.connectPromise = new Promise<void>((resolve, reject) => {
+      const onConnect = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      const cleanup = () => {
+        this.client.off("connect", onConnect);
+        this.client.off("error", onError);
+        this.connectPromise = null;
+      };
+
+      this.client.on("connect", onConnect);
+      this.client.on("error", onError);
+
+      try {
+        this.client.connect();
+      } catch (error) {
+        cleanup();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+
+    return this.connectPromise;
+  }
+}
 
 class HistoryPersistor {
   private pendingState: PersistedChatState | null = null;
@@ -150,12 +284,24 @@ class ChatStore {
   private readonly messages = new Map<string, ChatMessage>();
   private readonly order: string[] = [];
   private readonly clients = new Set<SseClient>();
+  private readonly eventHistory: BridgeEvent[] = [];
   private sequence = 0;
 
   listActiveMessages() {
     return this.order
       .map((id) => this.messages.get(id))
       .filter((message): message is ChatMessage => Boolean(message && message.status === "active"));
+  }
+
+  getSequence() {
+    return this.sequence;
+  }
+
+  eventsSnapshot(): EventsSnapshot {
+    return {
+      sequence: this.sequence,
+      messages: this.listActiveMessages(),
+    };
   }
 
   snapshot(): PersistedChatState {
@@ -182,7 +328,7 @@ class ChatStore {
     this.sequence = state.sequence;
   }
 
-  attachClient(controller: ReadableStreamDefaultController<Uint8Array>) {
+  attachClient(controller: ReadableStreamDefaultController<Uint8Array>, sinceSeq = 0) {
     const client: SseClient = {
       controller,
       heartbeatId: setInterval(() => {
@@ -191,9 +337,18 @@ class ChatStore {
     };
 
     this.clients.add(client);
+
+    if (sinceSeq > 0) {
+      for (const event of this.eventHistory) {
+        if (event.seq > sinceSeq) {
+          this.safeEnqueue(client, this.formatEvent(event));
+        }
+      }
+    }
+
     this.safeEnqueue(
       client,
-      `event: ready\ndata: ${JSON.stringify({
+      `id: ${this.sequence}\nevent: ready\ndata: ${JSON.stringify({
         seq: this.sequence,
         activeCount: this.listActiveMessages().length,
       })}\n\n`,
@@ -287,11 +442,21 @@ class ChatStore {
   }
 
   private emit(event: BridgeEvent) {
-    const payload = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+    this.eventHistory.push(event);
+
+    if (this.eventHistory.length > 2000) {
+      this.eventHistory.shift();
+    }
+
+    const payload = this.formatEvent(event);
 
     for (const client of [...this.clients]) {
       this.safeEnqueue(client, payload);
     }
+  }
+
+  private formatEvent(event: BridgeEvent) {
+    return `id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
   }
 
   private safeEnqueue(client: SseClient, chunk: string) {
@@ -873,6 +1038,56 @@ function firstNonEmpty(...values: string[]) {
   return values.find((value) => value.trim().length > 0) ?? "";
 }
 
+function normalizeTwitchChannel(channel: string) {
+  const normalized = channel.trim().toLowerCase().replace(/^#/, "");
+
+  if (!normalized) {
+    throw new Error("Missing Twitch channel");
+  }
+
+  return normalized;
+}
+
+function chatMessageTimestampMs(message: ChatMessage) {
+  const candidates = [message.firstSeenAt, message.lastSeenAt];
+
+  for (const value of candidates) {
+    const timestampMs = Date.parse(value);
+
+    if (Number.isFinite(timestampMs)) {
+      return timestampMs;
+    }
+  }
+
+  return Date.now();
+}
+
+function buildTimeline(messages: ChatMessage[], twitchMessages: TwitchChatMessage[]): TimelineEntry[] {
+  return [
+    ...twitchMessages.map<TimelineEntry>((message) => ({
+      kind: "twitch",
+      id: message.id,
+      timestampMs: message.timestampMs,
+    })),
+    ...messages.map<TimelineEntry>((message) => ({
+      kind: "youtube",
+      id: message.id,
+      timestampMs: chatMessageTimestampMs(message),
+      message,
+    })),
+  ].sort((left, right) => {
+    if (left.timestampMs !== right.timestampMs) {
+      return left.timestampMs - right.timestampMs;
+    }
+
+    if (left.kind === right.kind) {
+      return left.id.localeCompare(right.id);
+    }
+
+    return left.kind === "twitch" ? -1 : 1;
+  });
+}
+
 function parsePersistedMessage(value: unknown): ChatMessage | null {
   if (!value || typeof value !== "object") {
     return null;
@@ -1004,13 +1219,14 @@ async function startCollector(
 
 function startServer(
   store: ChatStore,
+  twitchStore: TwitchChatStore,
   debugStore: DebugStore,
   options: Pick<CliOptions, "host" | "port">,
 ) {
   const server = Bun.serve({
     hostname: options.host,
     port: options.port,
-    fetch(request) {
+    async fetch(request) {
       const url = new URL(request.url);
 
       if (request.method === "OPTIONS") {
@@ -1024,9 +1240,54 @@ function startServer(
       }
 
       if (url.pathname === "/messages") {
+        const snapshot = store.eventsSnapshot();
         return json(
           {
-            messages: store.listActiveMessages(),
+            seq: snapshot.sequence,
+            messages: snapshot.messages,
+          },
+          200,
+        );
+      }
+
+      if (url.pathname === "/timeline") {
+        const rawChannel = url.searchParams.get("channel") ?? "";
+
+        if (!rawChannel) {
+          return json({ error: "Missing required query param: channel" }, 400);
+        }
+
+        const channel = await twitchStore.ensureChannel(rawChannel);
+        const youtubeMessages = store.listActiveMessages().slice(-TIMELINE_YOUTUBE_LIMIT);
+        const twitchMessages = twitchStore.listChannelMessages(channel, 250);
+        const timeline = buildTimeline(youtubeMessages, twitchMessages).slice(-500);
+
+        return json(
+          {
+            seq: store.getSequence(),
+            channel,
+            youtubeMessages,
+            twitchMessages,
+            timeline,
+          },
+          200,
+        );
+      }
+
+      if (url.pathname === "/twitch/messages") {
+        const rawChannel = url.searchParams.get("channel") ?? "";
+
+        if (!rawChannel) {
+          return json({ error: "Missing required query param: channel" }, 400);
+        }
+
+        const channel = await twitchStore.ensureChannel(rawChannel);
+        const twitchMessages = twitchStore.listChannelMessages(channel, 250);
+
+        return json(
+          {
+            channel,
+            twitchMessages,
           },
           200,
         );
@@ -1048,11 +1309,18 @@ function startServer(
       }
 
       if (url.pathname === "/events") {
+        const sinceParam = Number.parseInt(url.searchParams.get("since") ?? "", 10);
+        const headerSince = Number.parseInt(request.headers.get("last-event-id") ?? "", 10);
+        const sinceSeq = Number.isFinite(headerSince)
+          ? headerSince
+          : Number.isFinite(sinceParam)
+            ? sinceParam
+            : 0;
         let detach = () => {};
 
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
-            detach = store.attachClient(controller);
+            detach = store.attachClient(controller, sinceSeq);
           },
           cancel() {
             detach();
@@ -1151,6 +1419,7 @@ async function main() {
     const store = new ChatStore(() => {
       historyPersistor.schedule(store.snapshot());
     });
+    const twitchStore = new TwitchChatStore();
     const debugStore = new DebugStore();
 
     if (options.resume) {
@@ -1165,7 +1434,7 @@ async function main() {
     }
 
     console.log(`[collector] chat url: ${chatUrl}`);
-    const server = startServer(store, debugStore, options);
+    const server = startServer(store, twitchStore, debugStore, options);
 
     const { browser, page } = await launchBrowser(chatUrl, options.headful);
     const bootstrap = await readBootstrap(page);
@@ -1182,6 +1451,10 @@ async function main() {
 
       try {
         server.stop(true);
+      } catch {}
+
+      try {
+        twitchStore.close();
       } catch {}
 
       try {

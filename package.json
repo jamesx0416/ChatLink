@@ -8,6 +8,7 @@
     "check": "bun run src/main.ts --help"
   },
   "dependencies": {
+    "@tmi.js/chat": "^0.7.5",
     "puppeteer": "^24.7.1"
   },
   "devDependencies": {

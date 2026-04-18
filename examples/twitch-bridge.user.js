@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chatlink Twitch Mirror
 // @namespace    chatlink
-// @version      0.5.0
+// @version      0.7.0
 // @description  Inject Chatlink localhost events into Twitch's native chat message flow.
 // @match        https://www.twitch.tv/*
 // @match        https://www.twitch.tv/popout/*/chat
@@ -19,18 +19,31 @@
   const BRIDGE_BASE = "http://127.0.0.1:8787";
   const MAX_RENDERED_MESSAGES = 120;
   const POLL_INTERVAL_MS = 2000;
+  const SSE_RETRY_DELAY_MS = 3000;
+  const TWITCH_HISTORY_REFRESH_DELAY_MS = 750;
   const DEBUG = false;
   const SHOW_BADGE = false;
   const STARTUP_CONTAINER_RETRIES = 10;
   const STATE = {
     booted: false,
     container: null,
+    channelLogin: "",
     messages: new Map(),
     nodes: new Map(),
+    latestTwitchMessages: [],
+    nativeObserver: null,
+    historySyncTimer: null,
     pollTimer: null,
+    eventSource: null,
+    reconnectTimer: null,
     lastError: "",
     lastPollAt: "",
     pollCount: 0,
+    transport: "idle",
+    lastSeq: 0,
+    sseFailures: 0,
+    suspended: false,
+    resumeInFlight: false,
     statusBadge: null,
   };
 
@@ -136,12 +149,78 @@
     return false;
   }
 
+  function getCurrentChannelLogin() {
+    const segments = window.location.pathname.split("/").filter(Boolean);
+
+    if (segments[0] === "popout" && segments[1]) {
+      return segments[1].toLowerCase();
+    }
+
+    return segments[0] ? segments[0].toLowerCase() : "";
+  }
+
+  function normalizeMatchText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
   function getScrollableParent() {
     return (
       document.querySelector('[data-a-target="chat-scroller"]') ||
       STATE.container?.closest(".scrollable-area") ||
       null
     );
+  }
+
+  function restartNativeObserver() {
+    if (STATE.nativeObserver) {
+      STATE.nativeObserver.disconnect();
+      STATE.nativeObserver = null;
+    }
+
+    if (!STATE.container) {
+      return;
+    }
+
+    STATE.nativeObserver = new MutationObserver((mutations) => {
+      const hasNativeChanges = mutations.some((mutation) =>
+        Array.from(mutation.addedNodes).some(
+          (node) =>
+            node instanceof HTMLElement &&
+            !node.hasAttribute("data-chatlink-shell"),
+        ),
+      );
+
+      if (!hasNativeChanges) {
+        return;
+      }
+
+      scheduleTwitchHistoryRefresh();
+    });
+
+    STATE.nativeObserver.observe(STATE.container, {
+      childList: true,
+      subtree: false,
+    });
+  }
+
+  function scheduleTwitchHistoryRefresh() {
+    if (STATE.historySyncTimer || !STATE.channelLogin || STATE.suspended) {
+      return;
+    }
+
+    STATE.historySyncTimer = setTimeout(async () => {
+      STATE.historySyncTimer = null;
+
+      try {
+        const payload = await requestJson(
+          `/twitch/messages?channel=${encodeURIComponent(STATE.channelLogin)}`,
+        );
+        STATE.latestTwitchMessages = Array.isArray(payload.twitchMessages) ? payload.twitchMessages : [];
+        matchNativeRowsToHistory(STATE.latestTwitchMessages);
+      } catch (error) {
+        log("failed to refresh twitch history", error);
+      }
+    }, TWITCH_HISTORY_REFRESH_DELAY_MS);
   }
 
   function ensureContainer() {
@@ -153,6 +232,7 @@
 
     if (STATE.container !== next) {
       STATE.container = next;
+      restartNativeObserver();
       rerenderAll();
     }
 
@@ -256,6 +336,43 @@
     return outer;
   }
 
+  function getContainerChild(node) {
+    let current = node;
+
+    while (current && current.parentElement && current.parentElement !== STATE.container) {
+      current = current.parentElement;
+    }
+
+    return current && current.parentElement === STATE.container ? current : null;
+  }
+
+  function listNativeTwitchRows() {
+    if (!STATE.container) {
+      return [];
+    }
+
+    const rows = Array.from(STATE.container.querySelectorAll('[data-a-target="chat-line-message"]'));
+
+    return rows
+      .filter((row) => !row.closest("[data-chatlink-shell]"))
+      .map((row) => {
+        const shell = getContainerChild(row);
+        const author = row.querySelector('[data-a-target="chat-message-username"]')?.textContent || "";
+        const body = Array.from(row.querySelectorAll('[data-a-target="chat-message-text"]'))
+          .map((node) => node.textContent || "")
+          .join(" ")
+          .trim();
+
+        return {
+          row,
+          shell,
+          author,
+          text: body,
+        };
+      })
+      .filter((entry) => entry.shell && entry.author && entry.text);
+  }
+
   function pickUsernameColor(message) {
     if (message.authorRole === "moderator") {
       return "#4aa3ff";
@@ -280,6 +397,42 @@
     }
   }
 
+  function messageTimestampMs(message) {
+    const candidates = [message.firstSeenAt, message.lastSeenAt];
+
+    for (const value of candidates) {
+      const timestampMs = Date.parse(value || "");
+
+      if (Number.isFinite(timestampMs)) {
+        return timestampMs;
+      }
+    }
+
+    return Date.now();
+  }
+
+  function findInsertionAnchor(timestampMs) {
+    if (!STATE.container) {
+      return null;
+    }
+
+    const children = Array.from(STATE.container.children);
+
+    for (const child of children) {
+      if (child.hasAttribute("data-chatlink-shell")) {
+        continue;
+      }
+
+      const twitchTimestampMs = Number.parseInt(child.dataset.chatlinkTwitchTs || "", 10);
+
+      if (Number.isFinite(twitchTimestampMs) && twitchTimestampMs > timestampMs) {
+        return child;
+      }
+    }
+
+    return null;
+  }
+
   function renderMessage(message) {
     STATE.messages.delete(message.id);
     STATE.messages.set(message.id, message);
@@ -295,9 +448,17 @@
 
     const nextNode = buildMessageNode(message);
     const existing = STATE.nodes.get(message.id);
+    const timestampMs = messageTimestampMs(message);
 
-    if (existing && existing.parentElement) {
-      existing.replaceWith(nextNode);
+    if (existing) {
+      existing.remove();
+      STATE.nodes.delete(message.id);
+    }
+
+    const beforeNode = findInsertionAnchor(timestampMs);
+
+    if (beforeNode) {
+      STATE.container.insertBefore(nextNode, beforeNode);
     } else {
       STATE.container.append(nextNode);
     }
@@ -332,10 +493,8 @@
     STATE.container.querySelectorAll("[data-chatlink-shell]").forEach((node) => node.remove());
     STATE.nodes.clear();
 
-    for (const message of STATE.messages.values()) {
-      const node = buildMessageNode(message);
-      STATE.container.append(node);
-      STATE.nodes.set(message.id, node);
+    for (const message of Array.from(STATE.messages.values())) {
+      renderMessage(message);
     }
   }
 
@@ -385,6 +544,88 @@
     });
   }
 
+  function clearPollTimer() {
+    if (!STATE.pollTimer) {
+      return;
+    }
+
+    clearTimeout(STATE.pollTimer);
+    STATE.pollTimer = null;
+  }
+
+  function clearReconnectTimer() {
+    if (!STATE.reconnectTimer) {
+      return;
+    }
+
+    clearTimeout(STATE.reconnectTimer);
+    STATE.reconnectTimer = null;
+  }
+
+  function closeEventSource() {
+    if (!STATE.eventSource) {
+      return;
+    }
+
+    STATE.eventSource.close();
+    STATE.eventSource = null;
+  }
+
+  function applyBridgeEvent(payload) {
+    if (!payload || typeof payload !== "object") {
+      return;
+    }
+
+    if (typeof payload.seq === "number") {
+      STATE.lastSeq = Math.max(STATE.lastSeq, payload.seq);
+    }
+
+    if (payload.type === "message_delete") {
+      removeMessage(payload.id, true);
+      return;
+    }
+
+    if (payload.message && typeof payload.message === "object") {
+      renderMessage(payload.message);
+    }
+  }
+
+  function matchNativeRowsToHistory(twitchMessages) {
+    if (!STATE.container) {
+      return;
+    }
+
+    Array.from(STATE.container.children).forEach((child) => {
+      if (!child.hasAttribute("data-chatlink-shell")) {
+        delete child.dataset.chatlinkTwitchTs;
+        delete child.dataset.chatlinkTwitchId;
+      }
+    });
+
+    const rows = listNativeTwitchRows();
+    let historyIndex = twitchMessages.length - 1;
+
+    for (let rowIndex = rows.length - 1; rowIndex >= 0; rowIndex -= 1) {
+      const entry = rows[rowIndex];
+      const author = normalizeMatchText(entry.author);
+      const text = normalizeMatchText(entry.text);
+
+      for (let candidateIndex = historyIndex; candidateIndex >= 0; candidateIndex -= 1) {
+        const candidate = twitchMessages[candidateIndex];
+
+        if (
+          normalizeMatchText(candidate.author) === author &&
+          normalizeMatchText(candidate.text) === text
+        ) {
+          entry.shell.dataset.chatlinkTwitchTs = String(candidate.timestampMs);
+          entry.shell.dataset.chatlinkTwitchId = candidate.id;
+          historyIndex = candidateIndex - 1;
+          break;
+        }
+      }
+    }
+  }
+
   function applySnapshot(messages) {
     const nextMessages = new Map();
 
@@ -402,21 +643,66 @@
     STATE.messages = nextMessages;
   }
 
+  function applyTimelineSnapshot(payload) {
+    const messages = Array.isArray(payload.youtubeMessages) ? payload.youtubeMessages : [];
+    const twitchMessages = Array.isArray(payload.twitchMessages) ? payload.twitchMessages : [];
+    const timeline = Array.isArray(payload.timeline) ? payload.timeline : [];
+    const youtubeIdsInTimeline = new Set(
+      timeline
+        .filter((entry) => entry && entry.kind === "youtube" && entry.message && entry.message.id)
+        .map((entry) => entry.message.id),
+    );
+    const nextMessages = new Map();
+
+    STATE.latestTwitchMessages = twitchMessages;
+    matchNativeRowsToHistory(twitchMessages);
+    STATE.container?.querySelectorAll("[data-chatlink-shell]").forEach((node) => node.remove());
+    STATE.nodes.clear();
+
+    for (const entry of timeline) {
+      if (!entry || entry.kind !== "youtube" || !entry.message || !youtubeIdsInTimeline.has(entry.message.id)) {
+        continue;
+      }
+
+      nextMessages.set(entry.message.id, entry.message);
+      renderMessage(entry.message);
+    }
+
+    for (const message of messages) {
+      if (!nextMessages.has(message.id)) {
+        nextMessages.set(message.id, message);
+      }
+    }
+
+    STATE.messages = nextMessages;
+  }
+
   async function loadSnapshot() {
-    const payload = await requestJson("/messages");
-    const messages = Array.isArray(payload.messages) ? payload.messages : [];
+    const payload = await requestJson(
+      `/timeline?channel=${encodeURIComponent(STATE.channelLogin)}`,
+    );
+    const messages = Array.isArray(payload.youtubeMessages) ? payload.youtubeMessages : [];
+    const nextSeq = Number.isFinite(payload.seq) ? payload.seq : 0;
     STATE.lastPollAt = new Date().toISOString();
     STATE.pollCount += 1;
+    STATE.lastSeq = Math.max(STATE.lastSeq, nextSeq);
     log("snapshot", {
       count: messages.length,
       pollCount: STATE.pollCount,
+      seq: STATE.lastSeq,
     });
-    setStatusBadge(`poll ${STATE.pollCount}, ${messages.length} messages`, "ok");
-    applySnapshot(messages);
+    setStatusBadge(`${STATE.transport} ${STATE.pollCount}, ${messages.length} messages`, "ok");
+    applyTimelineSnapshot(payload);
   }
 
   async function pollSnapshot() {
+    if (STATE.suspended) {
+      clearPollTimer();
+      return;
+    }
+
     try {
+      STATE.transport = "poll";
       ensureContainer();
       await loadSnapshot();
       STATE.lastError = "";
@@ -427,6 +713,141 @@
     } finally {
       STATE.pollTimer = setTimeout(pollSnapshot, POLL_INTERVAL_MS);
     }
+  }
+
+  function schedulePollFallback(reason) {
+    if (STATE.suspended) {
+      return;
+    }
+
+    if (STATE.pollTimer) {
+      return;
+    }
+
+    STATE.transport = "poll";
+    log("switching to poll fallback", {
+      reason,
+    });
+    setStatusBadge(`poll fallback: ${reason}`, "warn");
+    STATE.pollTimer = setTimeout(pollSnapshot, POLL_INTERVAL_MS);
+  }
+
+  function connectEventStream() {
+    if (STATE.suspended) {
+      return;
+    }
+
+    if (typeof EventSource !== "function") {
+      schedulePollFallback("EventSource unavailable");
+      return;
+    }
+
+    closeEventSource();
+    clearReconnectTimer();
+
+    try {
+      const es = new EventSource(`${BRIDGE_BASE}/events?since=${encodeURIComponent(String(STATE.lastSeq))}`);
+      STATE.eventSource = es;
+      STATE.transport = "sse";
+
+      es.addEventListener("open", () => {
+        STATE.sseFailures = 0;
+        clearPollTimer();
+        setStatusBadge(`sse live ${STATE.nodes.size} mirrored`, "ok");
+      });
+
+      es.addEventListener("ready", (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload && typeof payload.seq === "number") {
+            STATE.lastSeq = Math.max(STATE.lastSeq, payload.seq);
+          }
+        } catch (error) {
+          log("failed to parse ready event", error);
+        }
+      });
+
+      es.addEventListener("message_add", (event) => {
+        applyBridgeEvent(JSON.parse(event.data));
+      });
+
+      es.addEventListener("message_update", (event) => {
+        applyBridgeEvent(JSON.parse(event.data));
+      });
+
+      es.addEventListener("message_delete", (event) => {
+        applyBridgeEvent(JSON.parse(event.data));
+      });
+
+      es.onerror = () => {
+        if (STATE.suspended) {
+          closeEventSource();
+          return;
+        }
+
+        STATE.sseFailures += 1;
+        closeEventSource();
+
+        if (STATE.sseFailures >= 2) {
+          schedulePollFallback("sse blocked");
+          return;
+        }
+
+        setStatusBadge("sse reconnecting", "warn");
+        clearReconnectTimer();
+        STATE.reconnectTimer = setTimeout(() => {
+          STATE.reconnectTimer = null;
+          connectEventStream();
+        }, SSE_RETRY_DELAY_MS);
+      };
+    } catch (error) {
+      schedulePollFallback(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function suspendTransport(reason) {
+    STATE.suspended = true;
+    STATE.transport = "suspended";
+    clearPollTimer();
+    clearReconnectTimer();
+    if (STATE.historySyncTimer) {
+      clearTimeout(STATE.historySyncTimer);
+      STATE.historySyncTimer = null;
+    }
+    closeEventSource();
+    setStatusBadge(`paused: ${reason}`, "warn");
+  }
+
+  async function resumeTransport(reason) {
+    if (STATE.resumeInFlight) {
+      return;
+    }
+
+    STATE.resumeInFlight = true;
+    STATE.suspended = false;
+
+    try {
+      ensureContainer();
+      setStatusBadge(`resync: ${reason}`, "warn");
+      await loadSnapshot();
+      STATE.lastError = "";
+      STATE.sseFailures = 0;
+      connectEventStream();
+    } catch (error) {
+      STATE.lastError = error instanceof Error ? error.message : String(error);
+      schedulePollFallback(`resume failed: ${STATE.lastError}`);
+    } finally {
+      STATE.resumeInFlight = false;
+    }
+  }
+
+  function handleVisibilityChange() {
+    if (document.hidden) {
+      suspendTransport("tab hidden");
+      return;
+    }
+
+    void resumeTransport("tab visible");
   }
 
   function installStyle() {
@@ -486,6 +907,14 @@
       return;
     }
 
+    STATE.channelLogin = getCurrentChannelLogin();
+
+    if (!STATE.channelLogin) {
+      log("channel login not found");
+      STATE.booted = false;
+      return;
+    }
+
     installStyle();
 
     for (let attempt = 0; attempt < STARTUP_CONTAINER_RETRIES; attempt += 1) {
@@ -510,9 +939,23 @@
       exposeTestHook();
       setStatusBadge("loading snapshot", "idle");
       await loadSnapshot();
-      STATE.pollTimer = setTimeout(pollSnapshot, POLL_INTERVAL_MS);
+      if (document.hidden) {
+        suspendTransport("tab hidden");
+      } else {
+        connectEventStream();
+      }
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+      window.addEventListener("focus", () => {
+        if (!document.hidden) {
+          void resumeTransport("window focus");
+        }
+      });
       log("boot complete");
-      setStatusBadge(`boot complete, ${STATE.nodes.size} mirrored`, "ok");
+      if (STATE.suspended) {
+        setStatusBadge("paused: tab hidden", "warn");
+      } else {
+        setStatusBadge(`boot complete, ${STATE.nodes.size} mirrored`, "ok");
+      }
     } catch (error) {
       STATE.lastError = error instanceof Error ? error.message : String(error);
       console.error("chatlink boot failed", error);
