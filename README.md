@@ -70,7 +70,9 @@ Useful flags:
 - The bridge persists chat state to `.chatlink/history.json`. Use `--resume` to preload that snapshot after restarts.
 - The userscript prefers SSE for live YouTube updates and falls back to polling only when the browser blocks the stream.
 - Recent Twitch-native DOM changes are observed lightly to refresh anchor metadata, but the userscript no longer rerenders all mirrored YouTube rows on every Twitch message.
+- The userscript handles Twitch SPA channel changes in-place, so switching streams in the same tab no longer requires a full reload.
+- If a native Twitch anchor row is added or removed, the userscript refreshes recent Twitch IRC history and incrementally reanchors existing YouTube rows.
 - `youtubei` is an internal web endpoint, not a stable public API. Expect occasional breakage when YouTube changes its web client.
-- Twitch ordering is still best-effort. Native Twitch rows are matched back to IRC history by visible `author + text`, so duplicate lines can still be ambiguous.
+- Twitch ordering is still best-effort. Native Twitch rows are aligned against recent IRC history, which is much better than a greedy text match but still depends on Twitch's visible DOM.
 - The Twitch userscript in `examples/twitch-bridge.user.js` depends on Twitch's current DOM structure, so selectors there may still need adjustment when Twitch changes its UI.
 - Some streams may show consent or age gates before chat becomes readable. Those cases are not handled yet.

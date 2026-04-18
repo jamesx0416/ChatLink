@@ -186,13 +186,21 @@
     }
 
     STATE.nativeObserver = new MutationObserver((mutations) => {
-      const hasNativeChanges = mutations.some((mutation) =>
-        Array.from(mutation.addedNodes).some(
+      const hasNativeChanges = mutations.some((mutation) => {
+        const addedNativeNodes = Array.from(mutation.addedNodes).some(
           (node) =>
             node instanceof HTMLElement &&
             !node.hasAttribute("data-chatlink-shell"),
-        ),
-      );
+        );
+        const removedAnchors = Array.from(mutation.removedNodes).some(
+          (node) =>
+            node instanceof HTMLElement &&
+            !node.hasAttribute("data-chatlink-shell") &&
+            Boolean(node.dataset.chatlinkTwitchId),
+        );
+
+        return addedNativeNodes || removedAnchors;
+      });
 
       if (!hasNativeChanges) {
         return;
@@ -221,6 +229,7 @@
         );
         STATE.latestTwitchMessages = Array.isArray(payload.twitchMessages) ? payload.twitchMessages : [];
         matchNativeRowsToHistory(STATE.latestTwitchMessages);
+        reanchorInjectedMessages();
       } catch (error) {
         log("failed to refresh twitch history", error);
       }
@@ -693,6 +702,37 @@
     STATE.lastError = "";
     STATE.sseFailures = 0;
     STATE.transport = "idle";
+  }
+
+  function reanchorInjectedMessages() {
+    if (!STATE.container || STATE.nodes.size === 0) {
+      return;
+    }
+
+    const orderedMessages = Array.from(STATE.messages.values()).sort(
+      (left, right) => messageTimestampMs(left) - messageTimestampMs(right),
+    );
+
+    for (const message of orderedMessages) {
+      const node = STATE.nodes.get(message.id);
+
+      if (!node) {
+        continue;
+      }
+
+      const beforeNode = findInsertionAnchor(messageTimestampMs(message));
+
+      if (beforeNode) {
+        if (node !== beforeNode.previousSibling) {
+          STATE.container.insertBefore(node, beforeNode);
+        }
+        continue;
+      }
+
+      if (node !== STATE.container.lastElementChild) {
+        STATE.container.append(node);
+      }
+    }
   }
 
   function applyBridgeEvent(payload) {
