@@ -163,6 +163,10 @@
     return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
   }
 
+  function twitchSignature(author, text) {
+    return `${normalizeMatchText(author)}\n${normalizeMatchText(text)}`;
+  }
+
   function getScrollableParent() {
     return (
       document.querySelector('[data-a-target="chat-scroller"]') ||
@@ -373,6 +377,19 @@
       .filter((entry) => entry.shell && entry.author && entry.text);
   }
 
+  function assignedNativeTwitchIds() {
+    if (!STATE.container) {
+      return new Set();
+    }
+
+    return new Set(
+      Array.from(STATE.container.children)
+        .filter((child) => !child.hasAttribute("data-chatlink-shell"))
+        .map((child) => child.dataset.chatlinkTwitchId)
+        .filter(Boolean),
+    );
+  }
+
   function pickUsernameColor(message) {
     if (message.authorRole === "moderator") {
       return "#4aa3ff";
@@ -398,6 +415,10 @@
   }
 
   function messageTimestampMs(message) {
+    if (Number.isFinite(message.sentAtMs) && message.sentAtMs > 0) {
+      return message.sentAtMs;
+    }
+
     const candidates = [message.firstSeenAt, message.lastSeenAt];
 
     for (const value of candidates) {
@@ -595,34 +616,74 @@
       return;
     }
 
-    Array.from(STATE.container.children).forEach((child) => {
-      if (!child.hasAttribute("data-chatlink-shell")) {
-        delete child.dataset.chatlinkTwitchTs;
-        delete child.dataset.chatlinkTwitchId;
-      }
-    });
+    const usedIds = assignedNativeTwitchIds();
+    const rows = listNativeTwitchRows().filter((entry) => !entry.shell.dataset.chatlinkTwitchId);
+    const availableHistory = twitchMessages.filter((message) => !usedIds.has(message.id));
 
-    const rows = listNativeTwitchRows();
-    let historyIndex = twitchMessages.length - 1;
+    if (rows.length === 0 || availableHistory.length === 0) {
+      return;
+    }
 
-    for (let rowIndex = rows.length - 1; rowIndex >= 0; rowIndex -= 1) {
-      const entry = rows[rowIndex];
-      const author = normalizeMatchText(entry.author);
-      const text = normalizeMatchText(entry.text);
+    const rowSignatures = rows.map((entry) => twitchSignature(entry.author, entry.text));
+    const historySignatures = availableHistory.map((message) => twitchSignature(message.author, message.text));
+    const rowCount = rowSignatures.length;
+    const historyCount = historySignatures.length;
+    const dp = Array.from({ length: rowCount + 1 }, () => Array(historyCount + 1).fill(0));
 
-      for (let candidateIndex = historyIndex; candidateIndex >= 0; candidateIndex -= 1) {
-        const candidate = twitchMessages[candidateIndex];
+    for (let rowIndex = 1; rowIndex <= rowCount; rowIndex += 1) {
+      for (let historyIndex = 1; historyIndex <= historyCount; historyIndex += 1) {
+        let best = dp[rowIndex - 1][historyIndex];
 
-        if (
-          normalizeMatchText(candidate.author) === author &&
-          normalizeMatchText(candidate.text) === text
-        ) {
-          entry.shell.dataset.chatlinkTwitchTs = String(candidate.timestampMs);
-          entry.shell.dataset.chatlinkTwitchId = candidate.id;
-          historyIndex = candidateIndex - 1;
-          break;
+        if (dp[rowIndex][historyIndex - 1] > best) {
+          best = dp[rowIndex][historyIndex - 1];
         }
+
+        if (rowSignatures[rowIndex - 1] === historySignatures[historyIndex - 1]) {
+          const matchScore = dp[rowIndex - 1][historyIndex - 1] + 1000 + historyIndex;
+
+          if (matchScore > best) {
+            best = matchScore;
+          }
+        }
+
+        dp[rowIndex][historyIndex] = best;
       }
+    }
+
+    const matches = [];
+    let rowIndex = rowCount;
+    let historyIndex = historyCount;
+
+    while (rowIndex > 0 && historyIndex > 0) {
+      const rowSignature = rowSignatures[rowIndex - 1];
+      const historySignature = historySignatures[historyIndex - 1];
+      const matchScore = rowSignature === historySignature ? dp[rowIndex - 1][historyIndex - 1] + 1000 + historyIndex : -1;
+
+      if (matchScore === dp[rowIndex][historyIndex]) {
+        matches.push([rowIndex - 1, historyIndex - 1]);
+        rowIndex -= 1;
+        historyIndex -= 1;
+        continue;
+      }
+
+      if (dp[rowIndex][historyIndex - 1] >= dp[rowIndex - 1][historyIndex]) {
+        historyIndex -= 1;
+      } else {
+        rowIndex -= 1;
+      }
+    }
+
+    for (const [matchedRowIndex, matchedHistoryIndex] of matches.reverse()) {
+      const entry = rows[matchedRowIndex];
+      const candidate = availableHistory[matchedHistoryIndex];
+
+      if (!entry || !candidate || usedIds.has(candidate.id)) {
+        continue;
+      }
+
+      entry.shell.dataset.chatlinkTwitchTs = String(candidate.timestampMs);
+      entry.shell.dataset.chatlinkTwitchId = candidate.id;
+      usedIds.add(candidate.id);
     }
   }
 

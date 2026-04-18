@@ -21,6 +21,7 @@ type ChatMessage = {
   authorRole: "moderator" | "member" | "default";
   text: string;
   timestamp: string;
+  sentAtMs: number;
   rendererType: string;
   avatarUrl: string;
   firstSeenAt: string;
@@ -388,6 +389,7 @@ class ChatStore {
       existing.authorRole !== message.authorRole ||
       existing.text !== message.text ||
       existing.timestamp !== message.timestamp ||
+      existing.sentAtMs !== message.sentAtMs ||
       existing.avatarUrl !== message.avatarUrl ||
       existing.rendererType !== message.rendererType ||
       existing.status !== message.status;
@@ -402,6 +404,7 @@ class ChatStore {
     existing.authorRole = message.authorRole;
     existing.text = message.text;
     existing.timestamp = message.timestamp;
+    existing.sentAtMs = message.sentAtMs;
     existing.avatarUrl = message.avatarUrl;
     existing.rendererType = message.rendererType;
     existing.status = message.status;
@@ -916,6 +919,7 @@ function itemToMessage(item: unknown): Omit<ChatMessage, "firstSeenAt" | "lastSe
       textFromNode(payload.deletedStateMessage),
     ),
     timestamp: textFromNode(payload.timestampText) || asString(payload.timestampUsec),
+    sentAtMs: rawTimestampToMs(payload.timestampUsec),
     rendererType,
     avatarUrl: thumbnailUrl(payload.authorPhoto),
   };
@@ -1038,6 +1042,23 @@ function firstNonEmpty(...values: string[]) {
   return values.find((value) => value.trim().length > 0) ?? "";
 }
 
+function rawTimestampToMs(value: unknown) {
+  const raw =
+    typeof value === "string" ? value : typeof value === "number" ? String(value) : "";
+
+  if (!raw) {
+    return 0;
+  }
+
+  const numeric = Number.parseInt(raw, 10);
+
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return 0;
+  }
+
+  return raw.length >= 15 ? Math.floor(numeric / 1000) : numeric;
+}
+
 function normalizeTwitchChannel(channel: string) {
   const normalized = channel.trim().toLowerCase().replace(/^#/, "");
 
@@ -1049,6 +1070,10 @@ function normalizeTwitchChannel(channel: string) {
 }
 
 function chatMessageTimestampMs(message: ChatMessage) {
+  if (Number.isFinite(message.sentAtMs) && message.sentAtMs > 0) {
+    return message.sentAtMs;
+  }
+
   const candidates = [message.firstSeenAt, message.lastSeenAt];
 
   for (const value of candidates) {
@@ -1113,6 +1138,12 @@ function parsePersistedMessage(value: unknown): ChatMessage | null {
     authorRole,
     text: asString(message.text),
     timestamp: asString(message.timestamp),
+    sentAtMs:
+      rawTimestampToMs(message.sentAtMs) ||
+      rawTimestampToMs(message.timestamp) ||
+      Date.parse(asString(message.firstSeenAt) || now) ||
+      Date.parse(asString(message.lastSeenAt) || now) ||
+      Date.now(),
     rendererType: asString(message.rendererType),
     avatarUrl: asString(message.avatarUrl),
     firstSeenAt: asString(message.firstSeenAt) || now,
