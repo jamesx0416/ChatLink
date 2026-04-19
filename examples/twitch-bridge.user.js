@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chatlink Twitch Mirror
 // @namespace    chatlink
-// @version      0.8.5
+// @version      0.8.8
 // @description  Inject Chatlink localhost events into Twitch's native chat message flow.
 // @match        https://www.twitch.tv/*
 // @match        https://www.twitch.tv/popout/*/chat
@@ -21,6 +21,8 @@
   const CREATOR_CHANNEL_NAME = "@t3dotgg";
   const CREATOR_NICKNAME = "Theo";
   const SHOW_YT_PROFILE_PHOTO = true;
+  const MODERATOR_BADGE_VECTOR_PATH =
+    "M3 4.998v9.857a6 6 0 003.365 5.39L12 23l5.635-2.755A6 6 0 0021 14.855V4.998a1 1 0 00-.656-.938L12 1 3.656 4.06A1 1 0 003 4.998Z";
   const MAX_RENDERED_MESSAGES = 120;
   const POLL_INTERVAL_MS = 2000;
   const SSE_RETRY_DELAY_MS = 3000;
@@ -240,6 +242,11 @@
 
   function displayMessageText(message) {
     const originalText = String(message.text || "");
+    return replaceCreatorMentions(originalText);
+  }
+
+  function replaceCreatorMentions(value) {
+    const originalText = String(value || "");
     const nickname = creatorNickname();
     const mentionRegex = creatorMentionRegex("ig");
 
@@ -248,6 +255,39 @@
     }
 
     return originalText.replace(mentionRegex, (_, prefix) => `${prefix}${nickname}`);
+  }
+
+  function displayContentRuns(message) {
+    if (!Array.isArray(message.contentRuns) || message.contentRuns.length === 0) {
+      return [
+        {
+          kind: "text",
+          text: displayMessageText(message),
+        },
+      ];
+    }
+
+    return message.contentRuns.map((run) => {
+      if (!run || typeof run !== "object") {
+        return {
+          kind: "text",
+          text: "",
+        };
+      }
+
+      if (run.kind === "emoji") {
+        return {
+          kind: "emoji",
+          text: String(run.text || ""),
+          url: String(run.url || ""),
+        };
+      }
+
+      return {
+        kind: "text",
+        text: replaceCreatorMentions(run.text),
+      };
+    });
   }
 
   function linkifyTextParts(value) {
@@ -330,6 +370,86 @@
 
       container.append(document.createTextNode(part.value));
     }
+  }
+
+  function appendMessageContent(container, message) {
+    for (const run of displayContentRuns(message)) {
+      if (run.kind === "emoji") {
+        if (run.url) {
+          const image = document.createElement("img");
+          image.src = run.url;
+          image.alt = run.text;
+          image.title = run.text;
+          image.loading = "lazy";
+          image.referrerPolicy = "no-referrer";
+          image.style.display = "inline-block";
+          image.style.width = "20px";
+          image.style.height = "20px";
+          image.style.objectFit = "contain";
+          image.style.verticalAlign = "text-bottom";
+          image.style.margin = "0 1px";
+          container.append(image);
+          continue;
+        }
+
+        container.append(document.createTextNode(run.text));
+        continue;
+      }
+
+      appendLinkedText(container, run.text);
+    }
+  }
+
+  function buildRoleBadge(message) {
+    if (message.authorRole === "moderator") {
+      const wrap = document.createElement("span");
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+
+      wrap.style.display = "inline-flex";
+      wrap.style.alignItems = "center";
+      wrap.style.marginLeft = "4px";
+      wrap.style.verticalAlign = "middle";
+
+      svg.setAttribute("viewBox", "0 0 24 24");
+      svg.setAttribute("width", "14");
+      svg.setAttribute("height", "14");
+      svg.setAttribute("aria-hidden", "true");
+      svg.style.display = "block";
+      svg.style.fill = "currentColor";
+      svg.style.color = "rgb(41, 94, 205)";
+      svg.style.flexShrink = "0";
+
+      path.setAttribute("d", MODERATOR_BADGE_VECTOR_PATH);
+
+      svg.append(path);
+      wrap.append(svg);
+      return wrap;
+    }
+
+    if (message.authorRole === "member" && message.authorBadgeUrl) {
+      const wrap = document.createElement("span");
+      const image = document.createElement("img");
+
+      wrap.style.display = "inline-flex";
+      wrap.style.alignItems = "center";
+      wrap.style.marginLeft = "4px";
+      wrap.style.verticalAlign = "middle";
+      image.src = message.authorBadgeUrl;
+      image.alt = "";
+      image.width = 14;
+      image.height = 14;
+      image.loading = "lazy";
+      image.referrerPolicy = "no-referrer";
+      image.style.display = "block";
+      image.style.width = "14px";
+      image.style.height = "14px";
+      image.style.objectFit = "contain";
+      wrap.append(image);
+      return wrap;
+    }
+
+    return null;
   }
 
   function twitchSignature(author, text) {
@@ -439,6 +559,7 @@
     const badge = document.createElement("span");
     const usernameButton = document.createElement("span");
     const username = document.createElement("span");
+    const roleBadge = buildRoleBadge(message);
     const colon = document.createElement("span");
     const body = document.createElement("span");
     const text = document.createElement("span");
@@ -527,7 +648,7 @@
 
     text.className = "text-fragment";
     text.dataset.aTarget = "chat-message-text";
-    appendLinkedText(text, renderedText);
+    appendMessageContent(text, message);
 
     if (creatorRelated) {
       badge.style.background = "rgb(0, 0, 0)";
@@ -551,6 +672,9 @@
     badgeSlot.append(badge);
     usernameButton.append(username);
     usernameWrap.append(badgeSlot, usernameButton);
+    if (roleBadge) {
+      usernameWrap.append(roleBadge);
+    }
     body.append(text);
     content.append(usernameWrap, colon, body);
     noBg.append(content);

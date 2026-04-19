@@ -19,7 +19,9 @@ type ChatMessage = {
   author: string;
   authorChannelId: string;
   authorRole: "moderator" | "member" | "default";
+  authorBadgeUrl: string;
   text: string;
+  contentRuns: ChatMessageRun[];
   timestamp: string;
   sentAtMs: number;
   rendererType: string;
@@ -27,6 +29,17 @@ type ChatMessage = {
   firstSeenAt: string;
   lastSeenAt: string;
 };
+
+type ChatMessageRun =
+  | {
+      kind: "text";
+      text: string;
+    }
+  | {
+      kind: "emoji";
+      text: string;
+      url: string;
+    };
 
 type BridgeEvent =
   | {
@@ -387,7 +400,9 @@ class ChatStore {
       existing.author !== message.author ||
       existing.authorChannelId !== message.authorChannelId ||
       existing.authorRole !== message.authorRole ||
+      existing.authorBadgeUrl !== message.authorBadgeUrl ||
       existing.text !== message.text ||
+      JSON.stringify(existing.contentRuns) !== JSON.stringify(message.contentRuns) ||
       existing.timestamp !== message.timestamp ||
       existing.sentAtMs !== message.sentAtMs ||
       existing.avatarUrl !== message.avatarUrl ||
@@ -402,7 +417,9 @@ class ChatStore {
     existing.author = message.author;
     existing.authorChannelId = message.authorChannelId;
     existing.authorRole = message.authorRole;
+    existing.authorBadgeUrl = message.authorBadgeUrl;
     existing.text = message.text;
+    existing.contentRuns = message.contentRuns;
     existing.timestamp = message.timestamp;
     existing.sentAtMs = message.sentAtMs;
     existing.avatarUrl = message.avatarUrl;
@@ -899,6 +916,15 @@ function itemToMessage(item: unknown): Omit<ChatMessage, "firstSeenAt" | "lastSe
 
   const payload = renderer as Record<string, unknown>;
   const id = asString(payload.id);
+  const primaryContentNode =
+    firstNodeWithRuns(
+      payload.message,
+      payload.purchaseAmountText,
+      payload.headerPrimaryText,
+      payload.headerSubtext,
+      payload.primaryText,
+      payload.deletedStateMessage,
+    ) ?? payload.message;
 
   if (!id) {
     return null;
@@ -910,6 +936,8 @@ function itemToMessage(item: unknown): Omit<ChatMessage, "firstSeenAt" | "lastSe
     author: textFromNode(payload.authorName),
     authorChannelId: asString(payload.authorExternalChannelId),
     authorRole: authorRoleFromBadges(payload.authorBadges),
+    authorBadgeUrl: authorBadgeUrlFromBadges(payload.authorBadges),
+    contentRuns: messageRunsFromNode(primaryContentNode),
     text: firstNonEmpty(
       textFromNode(payload.message),
       textFromNode(payload.purchaseAmountText),
@@ -984,6 +1012,34 @@ function authorRoleFromBadges(value: unknown): "moderator" | "member" | "default
   return "default";
 }
 
+function authorBadgeUrlFromBadges(value: unknown): string {
+  if (!Array.isArray(value)) {
+    return "";
+  }
+
+  for (const entry of value) {
+    const renderer = (entry as { liveChatAuthorBadgeRenderer?: Record<string, unknown> })
+      ?.liveChatAuthorBadgeRenderer;
+
+    if (!renderer) {
+      continue;
+    }
+
+    const customThumbnail = renderer.customThumbnail as
+      | {
+          thumbnails?: Array<{ url?: string }>;
+        }
+      | undefined;
+    const url = customThumbnail?.thumbnails?.[customThumbnail.thumbnails.length - 1]?.url ?? "";
+
+    if (url) {
+      return url;
+    }
+  }
+
+  return "";
+}
+
 function textFromNode(value: unknown): string {
   if (!value || typeof value !== "object") {
     return "";
@@ -1018,6 +1074,64 @@ function textFromNode(value: unknown): string {
   }
 
   return "";
+}
+
+function firstNodeWithRuns(...values: unknown[]) {
+  return values.find((value) => {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+
+    return Array.isArray((value as { runs?: unknown[] }).runs);
+  });
+}
+
+function messageRunsFromNode(value: unknown): ChatMessageRun[] {
+  if (!value || typeof value !== "object") {
+    return [];
+  }
+
+  const node = value as {
+    simpleText?: string;
+    runs?: Array<{
+      text?: string;
+      emoji?: {
+        shortcuts?: string[];
+        image?: {
+          thumbnails?: Array<{ url?: string }>;
+        };
+      };
+    }>;
+  };
+
+  if (Array.isArray(node.runs)) {
+    return node.runs.flatMap((run) => {
+      if (typeof run.text === "string" && run.text.length > 0) {
+        return [{ kind: "text", text: run.text } satisfies ChatMessageRun];
+      }
+
+      const shortcut = run.emoji?.shortcuts?.[0];
+
+      if (typeof shortcut !== "string" || shortcut.length === 0) {
+        return [];
+      }
+
+      const thumbnails = run.emoji?.image?.thumbnails;
+      const url = Array.isArray(thumbnails) && thumbnails.length > 0 ? thumbnails[thumbnails.length - 1]?.url ?? "" : "";
+
+      if (!url) {
+        return [{ kind: "text", text: shortcut } satisfies ChatMessageRun];
+      }
+
+      return [{ kind: "emoji", text: shortcut, url } satisfies ChatMessageRun];
+    });
+  }
+
+  if (typeof node.simpleText === "string" && node.simpleText.length > 0) {
+    return [{ kind: "text", text: node.simpleText } satisfies ChatMessageRun];
+  }
+
+  return [];
 }
 
 function thumbnailUrl(value: unknown): string {
@@ -1129,6 +1243,29 @@ function parsePersistedMessage(value: unknown): ChatMessage | null {
   const authorRole =
     message.authorRole === "moderator" || message.authorRole === "member" ? message.authorRole : "default";
   const now = new Date().toISOString();
+  const contentRuns = Array.isArray(message.contentRuns)
+    ? message.contentRuns.flatMap((entry) => {
+        if (!entry || typeof entry !== "object") {
+          return [];
+        }
+
+        const run = entry as Record<string, unknown>;
+
+        if (run.kind === "emoji") {
+          const text = asString(run.text);
+          const url = asString(run.url);
+
+          if (!text) {
+            return [];
+          }
+
+          return [{ kind: "emoji", text, url } satisfies ChatMessageRun];
+        }
+
+        const text = asString(run.text);
+        return text ? [{ kind: "text", text } satisfies ChatMessageRun] : [];
+      })
+    : [];
 
   return {
     id,
@@ -1136,7 +1273,9 @@ function parsePersistedMessage(value: unknown): ChatMessage | null {
     author: asString(message.author),
     authorChannelId: asString(message.authorChannelId),
     authorRole,
+    authorBadgeUrl: asString(message.authorBadgeUrl),
     text: asString(message.text),
+    contentRuns,
     timestamp: asString(message.timestamp),
     sentAtMs:
       rawTimestampToMs(message.sentAtMs) ||
