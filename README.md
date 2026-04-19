@@ -2,6 +2,8 @@
 
 Local bridge that opens a YouTube live chat in Puppeteer, bootstraps YouTube's internal `youtubei` live chat feed, and exposes normalized chat events on `localhost` for a userscript or extension.
 
+![ChatLink example](./example.png)
+
 ## Run
 
 1. Install dependencies:
@@ -13,13 +15,13 @@ bun install
 2. Start the bridge with a YouTube stream URL:
 
 ```bash
-bun run src/main.ts --yt-url 'https://www.youtube.com/watch?v=VIDEO_ID' --resume
+bun run src/main.ts --yt-url 'https://www.youtube.com/watch?v=VIDEO_ID'
 ```
 
 Or pass only the video ID:
 
 ```bash
-bun run src/main.ts --yt-id VIDEO_ID --resume
+bun run src/main.ts --yt-id VIDEO_ID
 ```
 
 Resume the last locally saved history before reconnecting:
